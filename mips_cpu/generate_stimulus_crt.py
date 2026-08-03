@@ -209,65 +209,48 @@ def mips_helper_reference():
     )
 
 
+MIPS_POLICY_REFINEMENT_PREAMBLE = """\
+You are improving a constrained-random instruction generator for a MIPS32 CPU \
+functional coverage test.
+
+The simulator and testbench interface are fixed. You may modify only the two \
+editable regions:
+- BEGIN/END LLM HELPER REGION (module scope)
+- BEGIN/END LLM BODY REGION (inside generate_instruction(coverage, rng))
+
+Requirements:
+- Output only valid Python code.
+- Return only the two editable regions, including their BEGIN/END markers.
+- Do not include markdown, comments outside the editable regions, or any \
+explanations.
+- Do not redefine generate_instruction(...); only provide the helper region \
+and the body region.
+
+Implementation requirements:
+- The helper region must contain reusable helper code, including at least one \
+helper function for instruction encoding or targeted instruction generation.
+- Do not place all encoding logic directly inside the body region.
+- Do not rely on helper functions defined elsewhere; assume the scaffold \
+provides none.
+- Place all per-call decision logic and the final return statement inside the \
+body region.
+
+Instruction generation:
+- Return either:
+  - a single valid MIPS32 test instruction encoded as a 32-bit integer, or
+  - a short list or tuple of valid 32-bit instruction encodings.
+- Generate only SPECIAL R-type ALU instructions, store instructions, or jump \
+instructions."""
+
+
 def build_mips_policy_refinement_prompt(
-    policy_text,
     coverage_plan,
     previous_helper_region,
     previous_body_region,
     max_missed_bins=120,
 ):
     return (
-        "You are improving a constrained-random instruction generator for a "
-        "MIPS32 CPU coverage test.\n"
-        "The simulator/testbench interface is fixed. You may edit only two "
-        "marked regions: BEGIN/END LLM HELPER REGION at module scope, and "
-        "BEGIN/END LLM BODY REGION inside generate_instruction(coverage, rng).\n\n"
-        "Rules:\n"
-        "- Return only Python code containing both editable marker pairs.\n"
-        "- Do not include markdown or explanations.\n"
-        "- Do not include def generate_instruction(...); return only the helper "
-        "region and the body region contents with their markers.\n"
-        "- The code must return either one valid MIPS test instruction as a "
-        "32-bit integer, or a short list/tuple of valid instructions. Use "
-        "SPECIAL R-type ALU, stores, or jumps only.\n"
-        "- Define helper functions/constants in the helper region.\n"
-        "- Include at least one helper function definition in the helper region "
-        "for instruction encoding or targeted generation. Do not leave all "
-        "encoding logic inline in the body region.\n"
-        "- Do not rely on helper functions from the policy file; the scaffold "
-        "intentionally provides none.\n"
-        "- Put per-call selection logic and the final return in the body region.\n"
-        "- Every path through the body must return an instruction integer or "
-        "instruction list. Include a final fallback return at the end of the "
-        "body; never let Python implicitly return None.\n"
-        "- Use the unreached bin groups below to spread generation across "
-        "instruction families, simple coverpoints, and RAW hazard pairs.\n"
-        "- Never gate an unconditional return on a single missing bin. If that "
-        "bin turns out to be hard or unreachable, the policy emits the same "
-        "instruction forever and covers nothing else. Guard every "
-        "miss()-driven special case with a probability (for example "
-        "rng.random() < 0.2) so exploration continues. This applies "
-        "especially to jal_br_forwards and to RAW hazard bins.\n"
-        "- For RAW hazard targets, return the producer and consumer as a "
-        "two-instruction list in the same response, for example "
-        "[enc_r('sra', rd, a, b), enc_r('sub', out, rd, c)]. Do not rely on "
-        "a pending instruction across calls for RAW hazards.\n"
-        "- CRITICAL: the RAW hazard bins are a full product space of 11 "
-        "producers (the 10 R-type ops plus jal) by 13 consumers (the 10 "
-        "R-type ops plus sb, sh, sw) = 143 bins. Do NOT hardcode one or two "
-        "specific pairs. Write nested loops over the producer and consumer "
-        "names and emit whichever pair is still missing. A policy that names "
-        "individual pairs literally will cover a handful of bins and "
-        "permanently miss the rest.\n"
-        "- CRITICAL: stores must stay reachable for the whole run. If the "
-        "only code path that emits sb/sh/sw sits behind one miss() check, "
-        "then as soon as that single bin is covered the policy stops "
-        "producing stores entirely and every remaining X->sb/sh/sw hazard "
-        "becomes unreachable. Drive store generation from the loop over the "
-        "product space, and keep an unconditional random chance of emitting "
-        "a store in the fallback path.\n"
-        "- Do not import modules, open files, define classes, or use exec/eval.\n"
-        "- Keep some randomness so CRT can still explore.\n\n"
+        f"{MIPS_POLICY_REFINEMENT_PREAMBLE}\n\n"
         f"{mips_helper_reference()}\n"
         f"{summarize_cpu_coverage(coverage_plan, max_missed_bins)}\n\n"
         "CURRENT HELPER REGION:\n"
@@ -516,10 +499,16 @@ def _hex_list(values):
     return [f"0x{value & 0xFFFFFFFF:08x}" for value in values]
 
 
-def _coverage_rate_or_empty(g_coverage):
-    if g_coverage.get() is None:
+def _coverage_rate_from_plan(coverage_plan):
+    """Derive the coverage rate from an already-built coverage plan.
+
+    get_coverage_rate() rebuilds the whole plan internally. Taking the rate
+    from a plan the caller already has keeps the inner loop at one plan
+    rebuild per cycle instead of three.
+    """
+    if not coverage_plan:
         return "", ""
-    return g_coverage.get_coverage_rate()
+    return sum(1 for hits in coverage_plan.values() if hits > 0), len(coverage_plan)
 
 
 def _coverage_plan_or_empty(g_coverage):
@@ -536,15 +525,15 @@ def write_mips_crt_trace_row(
     instructions,
     mips_state,
     coverage_before,
-    g_coverage,
+    coverage_after,
+    cov_hit,
+    cov_total,
 ):
-    coverage_after = _coverage_plan_or_empty(g_coverage)
     new_bins = sorted(
         name
         for name, hits in coverage_after.items()
         if hits > 0 and coverage_before.get(name, 0) == 0
     )
-    cov_hit, cov_total = _coverage_rate_or_empty(g_coverage)
     trace_writer.writerow(
         {
             "batch": batch_idx + 1,
@@ -641,6 +630,9 @@ def llm_crt_experiment(
             g_dut_state = GlobalDUTState()
             stimulus = Stimulus(insn_mem_updates=[], finish=False)
             last_printed_state = None
+            # Cumulative plan carried across cycles: this cycle's "after" is the
+            # next cycle's "before", so one rebuild per cycle suffices.
+            coverage_before = _coverage_plan_or_empty(g_coverage)
 
             with closing(StimulusSender(f"tcp://{server_ip_port}")) as stimulus_sender:
                 while not agent.end_simulation(g_dut_state, g_coverage):
@@ -650,10 +642,11 @@ def llm_crt_experiment(
                     stimulus.insn_mem_updates = [
                         insn & 0xFFFFFFFF for insn in instructions
                     ]
-                    coverage_before = _coverage_plan_or_empty(g_coverage)
                     mips_state, coverage = stimulus_sender.send_stimulus(stimulus)
                     g_dut_state.set(mips_state)
                     merge_cpu_coverage(g_coverage, coverage)
+                    coverage_after = _coverage_plan_or_empty(g_coverage)
+                    cov_hit, cov_total = _coverage_rate_from_plan(coverage_after)
                     write_mips_crt_trace_row(
                         trace_writer,
                         batch_idx,
@@ -662,9 +655,12 @@ def llm_crt_experiment(
                         instructions,
                         mips_state,
                         coverage_before,
-                        g_coverage,
+                        coverage_after,
+                        cov_hit,
+                        cov_total,
                     )
                     trace_file.flush()
+                    coverage_before = coverage_after
 
                     current_state = (mips_state.last_pc, mips_state.last_insn)
                     if (
@@ -676,6 +672,16 @@ def llm_crt_experiment(
                             f"{mips_state.last_insn:08x}\n"
                         )
                         last_printed_state = current_state
+
+                    # Stop as soon as the plan is full. The between-batch check
+                    # alone would keep driving stimulus for the rest of the
+                    # batch after there is nothing left to cover.
+                    if cov_total and cov_hit == cov_total:
+                        print(
+                            f"Full coverage reached at cycle "
+                            f"{agent.current_cycle}; ending batch early."
+                        )
+                        break
 
                 finish_stimulus = Stimulus(insn_mem_updates=[], finish=True)
                 _, final_coverage = stimulus_sender.send_stimulus(finish_stimulus)
@@ -708,7 +714,6 @@ def llm_crt_experiment(
             )
 
             prompt = build_mips_policy_refinement_prompt(
-                current_policy_text,
                 g_coverage.get_coverage_plan(),
                 previous_helper_region,
                 previous_body_region,
@@ -760,6 +765,15 @@ def llm_crt_experiment(
                     break
 
             if accepted_region is None:
+                # write_updated_policy writes before validating, so a fully
+                # rejected iteration leaves its last candidate at
+                # next_policy_path. Move it aside: policy_iter_*.py must mean
+                # "this policy actually drove a batch".
+                if os.path.exists(next_policy_path):
+                    os.replace(
+                        next_policy_path,
+                        os.path.join(log_dir, f"rejected_iter_{batch_idx + 1}.py"),
+                    )
                 append_policy_rejection_log(
                     policy_log_path,
                     batch_idx + 1,

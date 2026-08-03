@@ -522,7 +522,6 @@ def llm_crt_experiment(
             )
 
             prompt = build_policy_refinement_prompt(
-                current_policy_text,
                 g_coverage.get_coverage_plan(),
                 previous_helper_region,
                 previous_body_region,

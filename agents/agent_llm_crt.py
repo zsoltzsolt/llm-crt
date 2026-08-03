@@ -432,7 +432,6 @@ def helper_reference() -> str:
 
 
 def build_policy_refinement_prompt(
-    policy_text: str,
     coverage_plan: Dict[str, int],
     previous_helper_region: str,
     previous_body_region: str,
