@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Simulator/build outputs
+sim_build/
+*/sim_build/
+results.xml
+trace_core_*.log
+*.vcd
+*.fst
+*.fst.hier
+
+# Coverage outputs
+coverage/
+*/logs/coverage/
+*.coverage
+.coverage
+htmlcov/
+
+# Local/generated experiment artifacts
+example_output.csv
+ibex_decoder/logs/example.csv
+ibex_cpu/logs/CRT_experiments.csv
+
+# LLM-CRT run artifacts: per-stimulus traces reach 100MB+ per run.
+# The policies (policy_iter_*.py) and prompts/responses
+# (policy_refinement.txt) stay tracked.
+stimulus_trace.csv
+
+# Secrets (API keys are read from the environment)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+*/logs/
+logs
