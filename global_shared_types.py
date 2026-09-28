@@ -1,19 +1,42 @@
-# Copyright Zixi Zhang
+# Copyright 2026 LLM-CRT Contributors.
 # Licensed under the Apache License, Version 2.0, see LICENSE for details.
 # SPDX-License-Identifier: Apache-2.0
 
 import re
 from typing import *
 
-from stride_detector.shared_types import CoverageDatabase as SDCD
-from ibex_decoder.shared_types import CoverageDatabase as IDCD
-from stride_detector.shared_types import DUTState as SDDS
-from ibex_cpu.shared_types import IbexStateInfo as ICDS
-from ibex_cpu.shared_types import CoverageDatabase as ICCD
+# This module is deliberately DUT-agnostic: it imports no DUT package.
+#
+# A DUT plugs in by satisfying two duck-typed contracts:
+#   coverage database -- get_coverage_dict() -> {bin_name: hit_count}
+#                        is_hard_bin(name) -> bool          (optional)
+#   DUT state         -- last_pc / last_insn attributes     (optional,
+#                        processor-like DUTs only)
+#                        RESET_PC class attribute           (optional)
+#
+# Adding a DUT therefore requires no edit to this file.
 
-# MIPS CPU
-from mips_cpu.shared_types import CoverageDatabase as MCCD
-from mips_cpu.shared_types import MipsStateInfo as MCDS
+# Reset vector reported for DUTs that do not declare RESET_PC (and for
+# non-processor DUTs, which still have to report some PC to the prompts).
+DEFAULT_RESET_PC = 0x00100080
+
+# Weight applied to bins a DUT declares "hard" when scoring coverage.
+HARD_BIN_WEIGHT = 2.5
+
+# Cross-coverage bin names produced by the existing DUTs. Used only as a
+# fallback when a coverage database does not declare is_hard_bin() -- e.g. when
+# coverage arrives as a plain {bin_name: count} dict.
+_CROSS_BIN_MARKERS = ("_x_", "raw_hazard", "->")
+
+
+def _is_coverage_database(coverage) -> bool:
+    return isinstance(coverage, dict) or hasattr(coverage, "get_coverage_dict")
+
+
+def _default_is_hard_bin(bin_name: str) -> bool:
+    if any(marker in bin_name for marker in _CROSS_BIN_MARKERS):
+        return True
+    return re.fullmatch(r"double_-?\d+_-?\d+", bin_name) is not None
 
 
 class GlobalCoverageDatabase:
@@ -30,127 +53,31 @@ class GlobalCoverageDatabase:
                 coverage, type(self._coverage_database)
             ), "New coverage is of different type of self._coverage_database."
 
-        if isinstance(coverage, SDCD):
-            self._coverage_database: SDCD
-        elif isinstance(coverage, IDCD):
-            self._coverage_database: IDCD
-        elif isinstance(coverage, MCCD) or isinstance(coverage, ICCD):
-            self._coverage_database: ICCD
-        elif coverage is None:
-            pass
-        else:
-            raise TypeError(f"Coverage of type {type(coverage)} is not supported.")
+        # DUT-agnostic contract: a coverage database is anything that can
+        # render itself as {bin_name: hit_count}, or a plain dict already in
+        # that form. Adding a DUT requires no change here.
+        if coverage is not None and not _is_coverage_database(coverage):
+            raise TypeError(
+                f"Coverage of type {type(coverage)} is not supported: expected a "
+                "dict of bin-name -> hit-count, or an object providing "
+                "get_coverage_dict()."
+            )
 
         self._coverage_database = coverage
 
     def get_coverage_plan(self) -> Dict[str, int]:
-        if isinstance(self._coverage_database, SDCD):
-            return self._get_coverage_plan_SD()
-        elif isinstance(self._coverage_database, IDCD):
-            return self._get_coverage_plan_ID()
-        elif isinstance(self._coverage_database, MCCD) or isinstance(
-            self._coverage_database, ICCD
-        ):
-            return self._get_coverage_plan_IC()
-        else:
-            raise TypeError(
-                f"coverage_database of type {type(self._coverage_database)} not supported."
-            )
-
-    def _get_coverage_plan_SD(self) -> Dict[str, int]:
-        coverage_plan = {}
-        for i, bin_val in enumerate(self._coverage_database.stride_1_seen):
-            if i >= 16:
-                i -= 32
-            coverage_plan[f"single_{i}"] = bin_val
-        for i, bins in enumerate(self._coverage_database.stride_2_seen):
-            for j, bin_val in enumerate(bins):
-                if i >= 16:
-                    i -= 32
-                if j >= 16:
-                    j -= 32
-                if i == j:
-                    continue
-                coverage_plan[f"double_{i}_{j}"] = bin_val
-        coverage_plan = {**coverage_plan, **self._coverage_database.misc_bins}
-        return coverage_plan
-
-    def _get_coverage_plan_ID(self) -> Dict[str, int]:
-        coverage_plan = {}
-        op_bins = ["alu_ops", "alu_imm_ops", "misc", "load_ops", "store_ops"]
-        reg_bins = ["read_reg_a", "read_reg_b", "write_reg"]
-        cross_bins = [
-            "alu_ops_x_read_reg_a",
-            "alu_ops_x_read_reg_b",
-            "alu_ops_x_write_reg",
-            "alu_imm_ops_x_read_reg_a",
-            "alu_imm_ops_x_write_reg",
-            "load_ops_x_read_reg_a",
-            "load_ops_x_write_reg",
-            "store_ops_x_read_reg_a",
-            "store_ops_x_read_reg_b",
-        ]
-
-        for bins_type in op_bins:
-            bins: Dict[str, int] = getattr(self._coverage_database, bins_type)
-            for op, v in bins.items():
-                op = op.upper()
-                k = f"{bins_type}_{op}"
-                if bins_type == "alu_ops":
-                    k = op
-                elif bins_type == "alu_imm_ops":
-                    k = f"{op}I"
-                elif bins_type == "misc":
-                    k = "illegal_instruction"
-                elif bins_type == "load_ops":
-                    k = f"L{op[0]}"
-                elif bins_type == "store_ops":
-                    k = f"S{op[0]}"
-                coverage_plan[k] = v
-
-        for bins_type in reg_bins:
-            bins: List[int] = getattr(self._coverage_database, bins_type)
-            for i, v in enumerate(bins):
-                k = f"{bins_type}_{i}"
-                if bins_type == "read_reg_a":
-                    k = f"read_A_reg_{i}"
-                elif bins_type == "read_reg_b":
-                    k = f"read_B_reg_{i}"
-                elif bins_type == "write_reg":
-                    k = f"write_reg_{i}"
-                coverage_plan[k] = v
-
-        for bins_type in cross_bins:
-            bins: Dict[str, List[int]] = getattr(self._coverage_database, bins_type)
-            for op, regs in bins.items():
-                op = op.upper()
-                for i, v in enumerate(regs):
-                    k = f"{bins_type}__{op}_{i}"
-                    if bins_type == "alu_ops_x_read_reg_a":
-                        k = f"{op}_x_read_A_reg_{i}"
-                    elif bins_type == "alu_ops_x_read_reg_b":
-                        k = f"{op}_x_read_B_reg_{i}"
-                    elif bins_type == "alu_ops_x_write_reg":
-                        k = f"{op}_x_write_reg_{i}"
-                    elif bins_type == "alu_imm_ops_x_read_reg_a":
-                        k = f"{op}I_x_read_A_reg_{i}"
-                    elif bins_type == "alu_imm_ops_x_write_reg":
-                        k = f"{op}I_x_write_reg_{i}"
-                    elif bins_type == "load_ops_x_read_reg_a":
-                        k = f"L{op[0]}_x_read_A_reg_{i}"
-                    elif bins_type == "load_ops_x_write_reg":
-                        k = f"L{op[0]}_x_write_reg_{i}"
-                    elif bins_type == "store_ops_x_read_reg_a":
-                        k = f"S{op[0]}_x_read_A_reg_{i}"
-                    elif bins_type == "store_ops_x_read_reg_b":
-                        k = f"S{op[0]}_x_read_B_reg_{i}"
-                    coverage_plan[k] = v
-
-        return coverage_plan
-
-    def _get_coverage_plan_IC(self) -> Dict[str, int]:
-        self._coverage_database: ICCD
-        return self._coverage_database.get_coverage_dict()
+        cov = self._coverage_database
+        if cov is None:
+            return {}
+        if isinstance(cov, dict):
+            return cov
+        if hasattr(cov, "get_coverage_dict"):
+            return cov.get_coverage_dict()
+        raise TypeError(
+            f"coverage_database of type {type(cov)} not supported: expected a "
+            "dict of bin-name -> hit-count, or an object providing "
+            "get_coverage_dict()."
+        )
 
     def get_coverage_rate(self) -> Tuple[int, int]:
         coverage = self.get_coverage_plan()
@@ -158,38 +85,13 @@ class GlobalCoverageDatabase:
         return len(coverage_hit), len(coverage)
 
     def get_coverage_score(self, prioritise_harder_bins=True) -> float:
-        if isinstance(self._coverage_database, SDCD):
-            coverage_plan = self._get_coverage_plan_SD()
-            coverage = [k for (k, v) in coverage_plan.items() if v > 0]
-            if not prioritise_harder_bins:  # without prioritising harder bins
-                return len(coverage)
-            # Prioritise harder bins
-            return sum(
-                map(
-                    lambda k: 2.5
-                    if re.fullmatch(r"double_-?\d+_-?\d+", k) is not None
-                    else 1,
-                    coverage,
-                )
-            )
-        elif isinstance(self._coverage_database, IDCD):
-            coverage_plan = self._get_coverage_plan_ID()
-            coverage = [k for (k, v) in coverage_plan.items() if v > 0]
-            if not prioritise_harder_bins:  # without prioritising harder bins
-                return len(coverage)
-            # Prioritise harder bins
-            return sum(map(lambda k: 2.5 if "_x_" in k else 1, coverage))
-        elif isinstance(self._coverage_database, ICCD):
-            coverage_plan = self._get_coverage_plan_IC()
-            coverage = [k for (k, v) in coverage_plan.items() if v > 0]
-            if not prioritise_harder_bins:  # without prioritising harder bins
-                return len(coverage)
-            # TODO: Prioritise harder bins? not effective since delayed feedback
-            return sum(map(lambda k: 2.5 if "raw_hazard" in k else 1, coverage))
-        else:
-            raise TypeError(
-                f"coverage_database of type {type(self._coverage_database)} not supported."
-            )
+        coverage = [k for (k, v) in self.get_coverage_plan().items() if v > 0]
+        if not prioritise_harder_bins:
+            return len(coverage)
+        # Which bins count as "hard" is a property of the DUT's coverage plan,
+        # so each coverage database declares it via is_hard_bin().
+        is_hard = getattr(self._coverage_database, "is_hard_bin", _default_is_hard_bin)
+        return sum(HARD_BIN_WEIGHT if is_hard(k) else 1 for k in coverage)
 
 
 class GlobalDUTState:
@@ -207,23 +109,23 @@ class GlobalDUTState:
                 dut_state, type(self._dut_state)
             ), "New dut_state is of different type of self._dut_state."
 
-        if isinstance(dut_state, SDDS):
-            self._dut_state: SDDS
-        elif isinstance(dut_state, ICDS) or isinstance(dut_state, MCDS):
-            self._dut_state: ICDS
-        elif dut_state is None:
-            pass
-        else:
-            raise TypeError(f"DUT state of type {type(dut_state)} is not supported.")
-
+        # DUT states are plain data carriers. Processor-like DUTs expose
+        # last_pc/last_insn (and optionally RESET_PC); others expose whatever
+        # their own agent needs. No per-DUT registration is required here.
         self._dut_state = dut_state
 
     def _reset_pc(self):
-        # Ibex boots from 0x00100080; MIPS boots from the 0xbfc00000 reset vector.
-        return 0xBFC00000 if isinstance(self._dut_state, MCDS) else 0x00100080
+        # A processor DUT declares its own reset vector; Ibex's is the default
+        # for historical reasons (DUTs without a PC still report one).
+        return getattr(self._dut_state, "RESET_PC", DEFAULT_RESET_PC)
+
+    def _reports_retirement(self) -> bool:
+        return hasattr(self._dut_state, "last_pc") and hasattr(
+            self._dut_state, "last_insn"
+        )
 
     def get_pc(self):
-        if isinstance(self._dut_state, (ICDS, MCDS)):
+        if self._reports_retirement():
             if self._dut_state.last_pc is None:
                 # return "\"invalid\" since the CPU has tried to execute invalid instruction(s)."
                 if self.prev_valid_pc is None:
@@ -236,7 +138,7 @@ class GlobalDUTState:
             return hex(self.prev_valid_pc)
 
     def get_last_instr(self):
-        if isinstance(self._dut_state, (ICDS, MCDS)):
+        if self._reports_retirement():
             if self._dut_state.last_insn is None:
                 return (
                     None

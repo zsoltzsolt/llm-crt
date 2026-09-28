@@ -1,194 +1,137 @@
-<!--Copyright Zixi Zhang
+<!--
+Copyright 2026 LLM-CRT Contributors.
 Copyright lowRISC contributors.
 Licensed under the Apache License, Version 2.0, see LICENSE for details.
 SPDX-License-Identifier: Apache-2.0
 -->
-# LLM for Design Verification
 
-___LLM4DV___ is a benchmarking framework utilising large language models in hardware design verification. 
-This project provides a framework for incorporating LLMs in test stimuli generation (i.e. 
-generating inputs for testing a device). The goal is to generate stimuli to cover most of the test bins 
-(i.e. test cases) from a predefined coverage plan with the LLM using as few tokens as possible.
+# LLM-Driven Constrained Random Test (CRT) Generation for Hardware Verification
 
-This repository contains a number of designs along with cocotb testbenches to enable research into
-exploring ML techniques for DV. The three designs are:
+**LLM-CRT** (`llm-crt`) is a high-throughput framework for Large Language Model (LLM) guided **Constrained Random Test (CRT)** generation for hardware design verification.
 
-- stride_detector - A mock design of the core of a prefetcher
-- ibex_decoder - A standalone instantiaton of the decoder from the Ibex RISC-V
-  core
-- ibex_cpu - The full Ibex RISC-V core
+Instead of prompting an LLM for every single stimulus on every clock cycle (which is slow, fragile, and token-prohibitive), **LLM-CRT** prompts the LLM to synthesize and iteratively refine a **stochastic Python generation policy**. The policy is executed locally at full speed against a Verilator / Cocotb simulation. At the end of each batch (e.g. 100,000 cycles), remaining uncovered functional bins are summarized and fed back to the LLM to refine the generation policy.
 
-This paper https://arxiv.org/abs/2310.04535 has used the designs from this
-repository.
+---
 
-## Getting started
+## Key Features
 
-The simulation runs as a client-server model. The client side generates stimuli to the server. The server 
-side receives stimuli, computes coverage, and returns the DUT state and coverage back to the client.
+- **High Throughput**: 100,000+ simulation cycles per policy refinement batch; LLM reasoning occurs between batches, not per clock cycle.
+- **AST Safety & Policy Validation**: Automatic AST parsing, scope verification, dunder access prevention, and execution smoke-testing to reject broken LLM policy candidates automatically.
+- **Unified Modular Design (`DUTTarget`)**: Adding a new hardware target requires only defining a design folder under `designs/` with RTL, Cocotb testbench, and a `DUTTarget` subclass.
+- **Flexible LLM Provider Backend**: Built-in support for local LLMs via **Ollama** (`qwen2.5-coder`, `llama3`), **OpenAI** (`gpt-4o-mini`, `gpt-4o`), **Azure OpenAI**, and **OpenRouter**.
+- **Zero-Leak Benchmark Integrity**: Prompting includes only uncovered bin names, rules, and example syntax shapes—ensuring no ground-truth solution encodings or data leakage.
 
-### Software pre-requisites
+---
 
-You will need to install __cocotb__, you can find the installation guide here:
-https://docs.cocotb.org/en/stable/install.html
+## Hardware Target Designs
 
-Additionally, you'll need the dependencies listed in `python-requirements.txt`
-which can be installed with pip:
+The repository includes the following hardware target designs in `designs/`:
 
-> pip install --user -r python-requirements.txt
+- **`ibex_decoder`**: Standalone instantiation of the instruction decoder from the lowRISC Ibex RISC-V core (RV32I / RV32C compressed instructions).
+- **`ibex_cpu`**: Full lowRISC Ibex 32-bit RISC-V CPU core with memory bus agent, dynamic exception recovery, and pipeline cross-hazard monitoring.
+- **`mips_cpu`**: Complete MIPS32 CPU core supporting R-type, I-type, J-type instructions, delay slots, and coprocessor 0 control.
 
-(These requirements are needed for both the client and server)
+---
 
-__Verilator__ is used as the simulator. Pre-built binary packages are often out of
-date and a recent (v5 onwards) version of verilator is required, so it is
-recommended you build the latest stable tag (v5.012 at time of writing) from
-source as described here:
-https://verilator.org/guide/latest/install.html#detailed-build-instructions
+## Quickstart
 
-You may also want __GTKWave__: https://gtkwave.sourceforge.net/, this allows you to
-view the waveform output from a simulator run. Again it is recommended you build
-this from source. Note this is strictly optional and you may not have any need
-for it at all.
+### 1. Prerequisites
 
-### Running the simulation
+- **Python 3.10+**
+- **Verilator** (v5.0+ recommended)
+- **Cocotb** (v1.8+)
 
-1. Run `make` for the server and `generate_stimulus.py` for the client in the module's directory.
-   + You may need to run `make` under a Python venv.
-2. Specify port / IP address & port when the server and client processes start.
-3. Running logs will be stored as txt and csv files in `./[module]/logs` as default.
-
-To specify experiment and strategies for stimulus generation on the client side, edit the `generate_stimulus.py` file.
-
-For detailed information, see `README` files of each module.
-
-## Stimulus generation agents
-
-
-The stimulus generation agent that utilises LLM is defined in `./agents/agent_LLM.py`. It consists of five components:
-- Prompt generator: for generating system messages, initial queries, and iterative queries according to different templates and DUTs.
-  - Defined in `./prompt_generators`.
-  - They specify the "_Missed-bin sampling_" methods.
-- Stimulus generator: the LLM, which takes in a prompt together with previous conversation and responds with a text.
-  - Defined in `./models`. OpenAI's models and Llama 2 are provided.
-  - They specify the "_Best-iterative-message sampling_" methods and the "_Best-iterative-message resetting_" plans.
-- Extractor: for extracting numbers from the text response.
-  - Defined in `./stimuli_extractor.py`
-- Filter: for filtering out invalid numbers
-  - Defined in `./stimuli_filter.py`
-- Loggers: for logging prompts, responses, and coverage over experiment trials.
-  - Defined in `./loggers`. CSV and TXT loggers are provided.
-
-The "_Dialogue restarting_" plans are specified in `agent_LLM.py`.
-
-Please refer to `generate_stimulus.py` files for how to create and use the stimulus generation agent.
-
-
-
-## Repository structure
-
-
-Detailed structure:
+Install Python dependencies:
+```bash
+pip install -r python-requirements.txt
 ```
-.
-│  csv_helper.py                       # Utils for processing csv experiment logs
-│  flake.loc
-│  flake.nix
-│  global_shared_types.py              # Wrappers of CoverageDatabase and DUTState of the three modules
-│  main.py                             # Testing script
-│  python-requirements.txt
-│  README.md
-│  stimuli_extractor.py                # Extractor that extracts numbers from text response
-│  stimuli_filter.py                   # Filter that filters out invalid numbers
-│
-├─agents                               # Stimulus producing agent, which incorporate all methods of the client side
-│      agents_CLI.py
-│      agent_base.py
-│      agent_fschat.py
-│      agent_IC_dumb.py
-│      agent_ID_dumb.py
-│      agent_LLM.py
-│      agent_random.py
-│      agent_SD_dumb.py
-│    
-├─examples_IC                          # Manually created bin description of Ibex CPU
-│      bins_description.txt
-│    
-├─examples_ID                          # Manually created bin description of Ibex instruction decoder
-│      bins_description.txt
-│      bins_description_succinct.txt
-│      dut_code.txt
-│      tb_code.txt
-│
-├─examples_SD                          # Manually created bin description of stride detector
-│      bins_description.txt
-│      dut_code.txt
-│      tb_code.txt
-│
-├─examples_SD_analogue                 # Manually created task description, which is an analogue of the stride detector
-│      bins_description.txt
-│      dut_code.txt
-│      tb_code.txt
-│
-├─experiment_logs                      # Experiment running logs
-│  ├─logs_ID_gpt
-│  ├─logs_ID_llama2
-│  ├─logs_SD_fixed
-│  └─logs_SD_template
-│
-├─ibex_cpu                             # Ibex CPU module
-│  │  .flake8
-│  │  cocotb_ibex.py
-│  │  cocotb_ibex.sv
-│  │  generate_stimulus.py
-│  │  instructions.py
-│  │  instruction_monitor.py
-│  │  lint.sh
-│  │  Makefile
-│  │  mypy.ini
-│  │  README.md
-│  │  shared_types.py
-│  │  test_prog.bin
-│  │
-│  ├─logs
-│  └─src
-│
-├─ibex_decoder                         # Ibex instruction decoder module
-│  │  generate_stimulus.py
-│  │  ibex_consts.py
-│  │  ibex_decoder.sv
-│  │  ibex_decoder_cocotb.py
-│  │  ibex_decoder_wrap.sv
-│  │  ibex_pkg.sv
-│  │  Makefile
-│  │  shared_types.py
-│  │
-│  └─logs
-│
-├─loggers                              # Logging components of the agent, for logging txt and csv files
-│      logger_base.py
-│      logger_csv.py
-│      logger_txt.py
-│
-├─models                               # LLM components of the agent, for getting natural language responses from LLMs
-│      llm_base.py
-│      llm_gpt.py
-│      llm_llama2.py
-│
-├─prompt_generators                    # Prompting components of the agent, for generating question to the LLMs
-│      prompt_generator_base.py
-│      prompt_generator_fixed_ID.py
-│      prompt_generator_fixed_SD.py
-│      prompt_generator_template.py
-│      prompt_generator_template_IC.py
-│      prompt_generator_template_ID.py
-│      prompt_generator_template_SD.py
-│
-└─stride_detector                      # Stride detector module
-    │  generate_stimulus.py
-    │  Makefile
-    │  README.md
-    │  shared_types.py
-    │  stride_detector.sv
-    │  stride_detector_cocotb.py
-    │
-    └─logs
+
+---
+
+### 2. Running an Experiment
+
+#### Step 1: Start the Cocotb Simulation Testbench
+In one terminal, navigate to the target design directory, compile, and start the Verilator simulation server:
+```bash
+cd designs/ibex_decoder
+make
 ```
+When prompted by the testbench wrapper, enter a port number (e.g. `5050`).
+
+#### Step 2: Launch the LLM CRT Client
+In a second terminal, launch `run_crt.py`:
+
+**Using Local Ollama (`qwen2.5-coder`):**
+```bash
+python3 run_crt.py --design ibex_decoder --provider ollama --model qwen2.5-coder:14b --server 127.0.0.1:5050
+```
+
+**Using OpenAI (`gpt-4o-mini`):**
+```bash
+export OPENAI_API_KEY="your-api-key"
+python3 run_crt.py --design ibex_decoder --provider openai --model gpt-4o-mini --server 127.0.0.1:5050
+```
+
+To list all available registered hardware targets:
+```bash
+python3 run_crt.py --list
+```
+
+---
+
+## Project Structure
+
+```
+llm-crt/
+├── crt/                          # Core Framework Engine
+│   ├── __init__.py               # Package init & legacy policy unpickling aliases
+│   ├── agent.py                  # EditableCRTAgent policy runner & execution environment
+│   ├── base_target.py            # DUTTarget abstract base class & registry
+│   ├── llm_client.py             # LLM client supporting Ollama, OpenAI, Azure, & OpenRouter
+│   ├── policy_manager.py         # Standardized prompt builder, AST validation, & policy patcher
+│   └── runner.py                 # Batch simulation loop, coverage tracking, & trace logger
+│
+├── designs/                      # Hardware Target Designs (DUTs)
+│   ├── ibex_decoder/             # Ibex Instruction Decoder (RTL, TB, policy.py, target.py)
+│   ├── ibex_cpu/                 # Ibex RISC-V CPU (RTL, TB, policy.py, target.py)
+│   └── mips_cpu/                 # MIPS CPU (RTL, TB, policy.py, target.py)
+│
+├── docs/                         # Flow Documentation & Architecture
+│   └── llm_driven_crt_generation.md
+│
+├── run_crt.py                    # Unified CLI entrypoint
+├── global_shared_types.py        # Shared data structures for testbench IPC
+└── python-requirements.txt       # Python package dependencies
+```
+
+---
+
+## Adding a New Hardware Target Design
+
+Adding a new target design to the framework is clean and modular:
+
+1. Create a directory `designs/<new_design>/` containing your RTL files, Makefile, and Cocotb testbench.
+2. Create a `policy.py` containing the two editable region markers:
+   ```python
+   # BEGIN LLM HELPER REGION
+   # END LLM HELPER REGION
+
+   def generate_instruction(coverage, rng):
+       # BEGIN LLM BODY REGION
+       return rng.getrandbits(32)
+       # END LLM BODY REGION
+   ```
+3. Create a `target.py` defining a subclass of `DUTTarget` registered with `@register_target("<new_design>")`.
+4. Your target design will automatically be recognized by `python3 run_crt.py --list` and ready for experiments!
+
+---
+
+## Documentation
+
+For a detailed deep dive into the CRT refinement loop, validation safety rules, and prompt structure, see [`docs/llm_driven_crt_generation.md`](docs/llm_driven_crt_generation.md).
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
