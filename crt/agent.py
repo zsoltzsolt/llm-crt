@@ -5,14 +5,14 @@
 """Agent for executing editable Python CRT policies."""
 
 import random
-from typing import Any
+from typing import Any, Optional
 from crt.policy_manager import load_policy_module
 
 
 class EditableCRTAgent:
     """Agent that drives simulation using a local Python policy file."""
 
-    def __init__(self, policy_path: str, total_cycle: int = 300000, seed: float = 0):
+    def __init__(self, policy_path: str, total_cycle: Optional[int] = 300000, seed: float = 0):
         self.policy_path = policy_path
         self.total_cycle = total_cycle
         self.current_cycle = 0
@@ -20,6 +20,8 @@ class EditableCRTAgent:
         self.policy_module = load_policy_module(policy_path)
 
     def end_simulation(self, dut_state: Any, coverage_database: Any) -> bool:
+        if self.total_cycle is None or self.total_cycle <= 0:
+            return False
         return not (self.current_cycle < self.total_cycle)
 
     def reset(self) -> None:

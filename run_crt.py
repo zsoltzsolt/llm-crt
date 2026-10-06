@@ -56,13 +56,43 @@ def main(argv=None):
         "--batch-cycles",
         type=int,
         default=100000,
-        help="Number of simulation cycles per batch before LLM refinement",
+        help="Initial target simulation cycles per batch before LLM refinement",
+    )
+    parser.add_argument(
+        "--max-batch-cycles",
+        type=int,
+        default=500000,
+        help="Hard safety cap on maximum cycles for a single batch when dynamic cycles is enabled",
+    )
+    parser.add_argument(
+        "--dynamic-cycles",
+        action="store_true",
+        default=True,
+        help="Dynamically continue batch execution as long as new coverage hits are being made",
+    )
+    parser.add_argument(
+        "--no-dynamic-cycles",
+        dest="dynamic_cycles",
+        action="store_false",
+        help="Disable dynamic continuation and enforce fixed --batch-cycles limit",
     )
     parser.add_argument(
         "--max-batches",
         type=int,
         default=5,
         help="Maximum policy refinement batches to run",
+    )
+    parser.add_argument(
+        "--stagnation-window",
+        type=int,
+        default=10000,
+        help="Consecutive cycles without new coverage hits before ending batch due to stagnation",
+    )
+    parser.add_argument(
+        "--min-batch-cycles",
+        type=int,
+        default=10000,
+        help="Minimum simulation cycles to execute before checking stagnation stopping",
     )
     parser.add_argument(
         "--server",
@@ -98,6 +128,10 @@ def main(argv=None):
         target=target,
         batch_cycles=args.batch_cycles,
         max_batches=args.max_batches,
+        stagnation_window=args.stagnation_window,
+        min_batch_cycles=args.min_batch_cycles,
+        dynamic_cycles=args.dynamic_cycles,
+        max_batch_cycles=args.max_batch_cycles,
         server_ip_port=args.server,
         provider=args.provider,
         llm_model=args.model,
