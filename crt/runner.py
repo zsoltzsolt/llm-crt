@@ -5,6 +5,7 @@
 """Unified batch runner for LLM-driven CRT experiments."""
 
 import csv
+import json
 import os
 import shutil
 import time
@@ -95,14 +96,22 @@ def run_crt_experiment(
     target: DUTTarget,
     batch_cycles: int = 100000,
     max_batches: int = 5,
+    stagnation_window: int = 10000,
+    min_batch_cycles: int = 10000,
+    dynamic_cycles: bool = True,
+    max_batch_cycles: int = 500000,
     server_ip_port: Optional[str] = None,
     provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
     output_dir: Optional[str] = None,
 ):
-    """Run an LLM-driven CRT experiment against a DUTTarget."""
+    """Run an LLM-driven CRT experiment against a DUTTarget with dynamic continuation & early stopping."""
     print(f"Running LLM-guided CRT experiment on {target.name}...")
-    print(f"CRT batch cycles: {batch_cycles}")
+    print(f"CRT initial target cycles: {batch_cycles}")
+    if dynamic_cycles:
+        print(f"Dynamic cycles enabled: continues execution as long as coverage improves (stagnation window = {stagnation_window} cycles, max cap = {max_batch_cycles} cycles)")
+    else:
+        print(f"Fixed batch cycles: {batch_cycles} (early stopping window = {stagnation_window} cycles)")
     print(f"Max batches: {max_batches}")
     print(f"LLM refiner: provider={provider}, model={llm_model}\n")
 
@@ -116,6 +125,7 @@ def run_crt_experiment(
             "Please enter server's IP and port (e.g. 127.0.0.1:5050): "
         ).strip()
 
+    start_time = time.time()
     t = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = output_dir or os.path.join("./logs", f"{t}_{target.name}_crt")
     os.makedirs(log_dir, exist_ok=True)
@@ -124,12 +134,17 @@ def run_crt_experiment(
     current_policy_path = os.path.join(log_dir, "policy_iter_0.py")
     policy_log_path = os.path.join(log_dir, "policy_refinement.txt")
     trace_path = os.path.join(log_dir, "stimulus_trace.csv")
+    summary_path = os.path.join(log_dir, "batch_summary.json")
 
     shutil.copyfile(base_policy_path, current_policy_path)
 
     policy_refiner = None
     g_dut_state = GlobalDUTState()
     g_coverage = GlobalCoverageDatabase()
+
+    total_cycles_executed = 0
+    max_possible_cycles = max_batches * (max_batch_cycles if dynamic_cycles else batch_cycles)
+    batch_stats = []
 
     with open(trace_path, "w", newline="", encoding="UTF8") as trace_file:
         trace_writer = csv.DictWriter(
@@ -143,13 +158,19 @@ def run_crt_experiment(
                     f"\n===== CRT batch {batch_idx + 1}/{max_batches} "
                     f"using {current_policy_path} ====="
                 )
+                agent_cap = max_batch_cycles if dynamic_cycles else batch_cycles
                 agent = EditableCRTAgent(
                     current_policy_path,
-                    total_cycle=batch_cycles,
+                    total_cycle=agent_cap,
                     seed=datetime.now().timestamp() + batch_idx,
                 )
 
                 cov_before = _get_coverage_plan_dict(g_coverage)
+                prev_hit, _ = g_coverage.get_coverage_rate()
+                cycles_since_last_hit = 0
+                early_stopped = False
+                batch_start_cycles = total_cycles_executed
+                extended_past_target = False
 
                 while not agent.end_simulation(g_dut_state, g_coverage):
                     raw_instruction = agent.generate_next_value(g_dut_state, g_coverage)
@@ -163,10 +184,20 @@ def run_crt_experiment(
 
                     cov_after = _get_coverage_plan_dict(g_coverage)
                     cov_hit, cov_total = g_coverage.get_coverage_rate()
+                    total_cycles_executed += 1
+
+                    if cov_hit > prev_hit:
+                        cycles_since_last_hit = 0
+                        prev_hit = cov_hit
+                        if dynamic_cycles and agent.current_cycle > batch_cycles and not extended_past_target:
+                            print(f"  [Dynamic Extension] Policy is making improvements! Cycle {agent.current_cycle} > target {batch_cycles}. Continuing simulation...")
+                            extended_past_target = True
+                    else:
+                        cycles_since_last_hit += 1
 
                     if agent.current_cycle % 5000 == 0 or agent.current_cycle == 1:
                         pct = (cov_hit / cov_total * 100) if cov_total > 0 else 0.0
-                        print(f"  Batch {batch_idx + 1} | Cycle {agent.current_cycle}/{batch_cycles} | Coverage: {cov_hit}/{cov_total} ({pct:.1f}%)")
+                        print(f"  Batch {batch_idx + 1} | Cycle {agent.current_cycle} | Coverage: {cov_hit}/{cov_total} ({pct:.1f}%)")
 
                     target.write_trace_row(
                         trace_writer,
@@ -185,15 +216,41 @@ def run_crt_experiment(
 
                     if cov_total > 0 and cov_hit == cov_total:
                         print(
-                            f"Full coverage reached at cycle {agent.current_cycle}; ending batch early."
+                            f"Full coverage reached at cycle {agent.current_cycle}; ending batch."
                         )
+                        early_stopped = True
+                        break
+
+                    if (
+                        stagnation_window > 0
+                        and agent.current_cycle >= min_batch_cycles
+                        and cycles_since_last_hit >= stagnation_window
+                    ):
+                        print(
+                            f"  [Dynamic Stagnation Stop] Coverage stagnated (no new hits for {stagnation_window} cycles). "
+                            f"Ending batch {batch_idx + 1} at cycle {agent.current_cycle}."
+                        )
+                        early_stopped = True
                         break
 
                 cov_hit, cov_total = g_coverage.get_coverage_rate()
                 cov_percent = (cov_hit / cov_total * 100) if cov_total > 0 else 0
+                cycles_in_batch = total_cycles_executed - batch_start_cycles
+                batch_stats.append({
+                    "batch": batch_idx + 1,
+                    "cycles_run": cycles_in_batch,
+                    "max_cycles_budget": batch_cycles,
+                    "early_stopped": early_stopped,
+                    "cov_hit": cov_hit,
+                    "cov_total": cov_total,
+                    "cov_percent": cov_percent,
+                    "policy": current_policy_path,
+                })
+
                 print(
                     f"Coverage after batch {batch_idx + 1}: "
-                    f"({cov_hit}/{cov_total}) - {cov_percent:.2f}%"
+                    f"({cov_hit}/{cov_total}) - {cov_percent:.2f}% "
+                    f"(ran {cycles_in_batch}/{batch_cycles} cycles)"
                 )
 
                 if cov_hit == cov_total:
@@ -292,9 +349,39 @@ def run_crt_experiment(
             _, final_cov = target.parse_response(finish_reply)
             target.merge_coverage(g_coverage, final_cov)
 
+    total_wall_time = time.time() - start_time
+    cov_hit, cov_total = g_coverage.get_coverage_rate()
+    cycles_saved = max_possible_cycles - total_cycles_executed
+    percent_saved = (cycles_saved / max_possible_cycles * 100) if max_possible_cycles > 0 else 0.0
+
+    summary_data = {
+        "design": target.name,
+        "provider": provider,
+        "model": llm_model,
+        "max_batches": max_batches,
+        "configured_batch_cycles": batch_cycles,
+        "stagnation_window": stagnation_window,
+        "min_batch_cycles": min_batch_cycles,
+        "total_cycles_executed": total_cycles_executed,
+        "max_possible_cycles": max_possible_cycles,
+        "cycles_saved": cycles_saved,
+        "percent_cycles_saved": round(percent_saved, 2),
+        "wall_time_seconds": round(total_wall_time, 2),
+        "final_coverage_hit": cov_hit,
+        "final_coverage_total": cov_total,
+        "final_coverage_percent": round((cov_hit / cov_total * 100) if cov_total > 0 else 0.0, 2),
+        "batches": batch_stats,
+    }
+
+    with open(summary_path, "w", encoding="UTF8") as sf:
+        json.dump(summary_data, sf, indent=2)
+
     print(
         f"\nFinished CRT experiment on {target.name}.\n"
-        f"Final Coverage: {g_coverage.get_coverage_rate()}\n"
+        f"Final Coverage: {g_coverage.get_coverage_rate()} ({summary_data['final_coverage_percent']}%)\n"
+        f"Total Cycles Executed: {total_cycles_executed}/{max_possible_cycles} (Saved {cycles_saved} cycles, {percent_saved:.1f}%)\n"
+        f"Wall-clock Time: {total_wall_time:.2f}s\n"
+        f"Summary JSON: {summary_path}\n"
         f"Policy log: {policy_log_path}\n"
         f"Stimulus trace: {trace_path}\n"
     )
