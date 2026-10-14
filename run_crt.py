@@ -106,6 +106,11 @@ def main(argv=None):
         help="Directory to write run logs and stimulus trace artifacts",
     )
     parser.add_argument(
+        "--initial-policy",
+        default=None,
+        help="Policy file for batch 1 instead of the design's base policy (e.g. a baseline_random.py)",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List available target designs and exit",
@@ -136,6 +141,7 @@ def main(argv=None):
         provider=args.provider,
         llm_model=args.model,
         output_dir=args.output_dir,
+        initial_policy_path=args.initial_policy,
     )
     return 0
 

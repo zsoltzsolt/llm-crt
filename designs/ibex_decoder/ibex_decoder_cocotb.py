@@ -236,7 +236,7 @@ class SimulationController:
 async def basic_test(dut):
     from global_shared_types import GlobalCoverageDatabase
 
-    server_port = input("Please enter server's port (e.g. 5050, 5555): ")
+    server_port = os.environ.get("CRT_PORT") or input("Please enter server's port (e.g. 5050, 5555): ")
 
     trial_cnt = 0
 

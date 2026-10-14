@@ -52,6 +52,16 @@ class StimulusSender:
             self.socket.close()
 
 
+class UnchangedPolicyError(ValueError):
+    """The LLM returned the current policy regions unchanged."""
+
+
+def _same_regions(a, b) -> bool:
+    """Policy regions equal up to whitespace."""
+    normalize = lambda regions: tuple("".join(r.split()) for r in regions)
+    return normalize(a) == normalize(b)
+
+
 def append_policy_log(log_path, iteration, coverage_rate, prompt, response, region):
     with open(log_path, "a", encoding="UTF8") as f:
         f.write(f"\n===== ITERATION {iteration} =====\n")
@@ -104,6 +114,7 @@ def run_crt_experiment(
     provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
     output_dir: Optional[str] = None,
+    initial_policy_path: Optional[str] = None,
 ):
     """Run an LLM-driven CRT experiment against a DUTTarget with dynamic continuation & early stopping."""
     print(f"Running LLM-guided CRT experiment on {target.name}...")
@@ -130,7 +141,7 @@ def run_crt_experiment(
     log_dir = output_dir or os.path.join("./logs", f"{t}_{target.name}_crt")
     os.makedirs(log_dir, exist_ok=True)
 
-    base_policy_path = target.base_policy_path
+    base_policy_path = initial_policy_path or target.base_policy_path
     current_policy_path = os.path.join(log_dir, "policy_iter_0.py")
     policy_log_path = os.path.join(log_dir, "policy_refinement.txt")
     trace_path = os.path.join(log_dir, "stimulus_trace.csv")
@@ -282,8 +293,12 @@ def run_crt_experiment(
                 accepted_region = None
                 accepted_response = None
 
+                base_temperature = policy_refiner.temperature
                 for retry_idx in range(3):
                     response = ""
+                    # Retries sample at a higher temperature so a rejected answer
+                    # is not simply repeated.
+                    policy_refiner.temperature = min(1.0, base_temperature + 0.4 * retry_idx)
                     try:
                         response, _ = policy_refiner(prompt)
                         candidate_region = write_updated_policy(
@@ -292,10 +307,22 @@ def run_crt_experiment(
                             response,
                             allow_instruction_blocks=True,
                         )
+                        with open(next_policy_path, "r", encoding="UTF8") as f:
+                            if _same_regions(extract_policy_regions(f.read()), (prev_helper, prev_body)):
+                                raise UnchangedPolicyError(
+                                    "The returned policy is identical to the CURRENT policy, which left "
+                                    f"coverage at {cov_hit}/{cov_total}. Write a different strategy that "
+                                    "targets the uncovered bins listed above."
+                                )
                         target.validate_policy(next_policy_path, require_generated_helpers=True)
                         accepted_region = candidate_region
                         accepted_response = response
                         break
+                    except UnchangedPolicyError as e:
+                        last_error = e
+                        rejected_attempts.append((retry_idx + 1, response, e))
+                        prompt += f"\n\nYour previous answer was rejected: {e}\n"
+                        print(f"Rejected LLM policy update attempt {retry_idx + 1}/3: unchanged policy")
                     except (SyntaxError, ValueError, RuntimeError) as e:
                         last_error = e
                         rejected_attempts.append((retry_idx + 1, response, e))
@@ -312,6 +339,7 @@ def run_crt_experiment(
                         rejected_attempts.append((retry_idx + 1, response, e))
                         print(f"LLM query error ({e}); continuing with existing policy.")
                         break
+                policy_refiner.temperature = base_temperature
 
                 if accepted_region is None:
                     if os.path.exists(next_policy_path):
