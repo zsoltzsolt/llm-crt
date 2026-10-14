@@ -16,6 +16,9 @@ _TARGET_REGISTRY: Dict[str, type] = {}
 _KNOWN_DESIGNS = (
     "ibex_decoder",
     "ibex_cpu",
+    "ibex_cpu_l1",
+    "ibex_cpu_l2",
+    "ibex_cpu_l3",
     "mips_cpu",
 )
 

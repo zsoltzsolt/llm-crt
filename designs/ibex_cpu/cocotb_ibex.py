@@ -51,7 +51,7 @@ def enc_j(rd, imm):
 
 
 class MemAgent:
-    def __init__(self, dut, mem_name, default_load_val=0x0980006F, handle_writes=True):
+    def __init__(self, dut, mem_name, default_load_val=0x0980006F, handle_writes=True, jump_to_slot_default=True):
         self.mem_dict = {}
 
         self.clk = dut.clk_i
@@ -62,6 +62,10 @@ class MemAgent:
         self.rdata = getattr(dut, mem_name + "_rdata_i")
 
         self.default_load_val = default_load_val
+        # Unmapped reads near the slot return a JAL back to it. Must be off for
+        # instruction memory: entering such a word at its upper halfword decodes
+        # as a compressed jump-to-self and the core spins forever.
+        self.jump_to_slot_default = jump_to_slot_default
 
         self.handle_writes = handle_writes
 
@@ -117,7 +121,7 @@ class MemAgent:
                         self.rdata.value = self._u32(self.mem_dict[addr_int])
                     else:
                         delta = 0x100098 - addr_int
-                        if -1048576 <= delta <= 1048574 and (delta % 2 == 0):
+                        if self.jump_to_slot_default and -1048576 <= delta <= 1048574 and (delta % 2 == 0):
                             self.rdata.value = self._u32(enc_j(0, delta))
                         else:
                             self.rdata.value = self._u32(self.default_load_val)
@@ -186,16 +190,22 @@ class SimulationController:
 async def basic_test(dut):
     from global_shared_types import GlobalCoverageDatabase
 
-    server_port = input("Please enter server's port (e.g. 5050, 5555): ")
+    server_port = os.environ.get("CRT_PORT") or input("Please enter server's port (e.g. 5050, 5555): ")
 
     while True:
         dut.data_gnt_i.value = 0
         dut.data_rvalid_i.value = 0
 
-        imem_agent = MemAgent(dut, "instr", handle_writes=False)
+        # Unmapped instruction memory reads as an illegal instruction (both halfwords
+        # illegal), so any stray jump traps to 0x00100000, which jumps back to the slot.
+        imem_agent = MemAgent(
+            dut, "instr", default_load_val=0x00000000, handle_writes=False, jump_to_slot_default=False
+        )
         dmem_agent = MemAgent(dut, "data", handle_writes=True)
         ins_mon = InstructionMonitor(dut)
-        imem_agent.load_bin("test_prog.bin", 0x100080)
+        # Boot straight into the stimulus slot. The original test_prog.bin countdown
+        # loop is not loaded: a stray jump into it spins up to 2^32 times.
+        imem_agent.write_mem(0x100080, enc_j(0, 0x100098 - 0x100080))
         imem_agent.write_mem(0x10009C, 0xFFDFF06F)  # JAL x0, -4 (jump back to 0x100098)
         imem_agent.write_mem(0x00100000, 0x0980006F)  # JAL x0, 152 (jump from trap handler back to 0x100098)
 

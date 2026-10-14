@@ -43,10 +43,10 @@ def summarize_cpu_coverage(coverage_plan, max_missed_bins=120):
         remaining_budget = max_missed_bins - shown_count
         if remaining_budget <= 0:
             break
-        examples = group_bins[: min(8, remaining_budget)]
+        examples = group_bins[:remaining_budget]
         shown_count += len(examples)
         summary.append(
-            f"- {group_name}: {len(group_bins)} missed; examples: "
+            f"- {group_name}: {len(group_bins)} missed: "
             f"{', '.join(examples)}"
         )
 
@@ -82,6 +82,12 @@ def cpu_helper_reference():
         "- R-type ALU ops use opcode 0x33: add (funct7=0x00, funct3=0), sub (0x20/0), sll (0x00/1), slt (0x00/2), sltu (0x00/3), xor (0x00/4), srl (0x00/5), sra (0x20/5), or (0x00/6), and (0x00/7).\n"
         "- S-type stores use opcode 0x23: sb (funct3=0), sh (1), sw (2).\n"
         "- JAL uses opcode 0x6f.\n"
+        "- Coverpoints (bin name = <instr>_<coverpoint>): seen = executed; zero_dst = rd is x0; zero_src = rs1 or rs2 is x0; "
+        "same_src = rs1 == rs2; br_backwards / br_forwards = jal offset < 0 / > 0.\n"
+        "- <prev>-><curr>_raw_hazard: <curr> reads (as rs1 or rs2) the register that the immediately preceding executed "
+        "instruction <prev> wrote as rd. <prev> is an R-type ALU op or jal; <curr> is an R-type ALU op or a store. "
+        "To hit one, return a list in which <prev> writes some register r and the next instruction <curr> reads r, "
+        "e.g. [enc_r(0x20, 2, 3, 0, 5), enc_r(0, 6, 5, 0, 7)] hits sub->add_raw_hazard (sub writes x5, add reads x5).\n"
         "- ALWAYS include stochastic fallback logic (e.g. rng.choice for random op/funct/registers) at the end of the body region!\n"
     )
 
@@ -93,6 +99,19 @@ def enc_j(rd, imm):
     i11 = (imm >> 11) & 1
     i19_12 = (imm >> 12) & 0xFF
     return (i20 << 31) | (i10_1 << 21) | (i11 << 20) | (i19_12 << 12) | ((rd & 31) << 7) | 0x6F
+
+
+def _block_trap_vector_writes(insn):
+    """Replace CSR writes to mtvec (0x305) and Ibex's cpuctrlsts/secureseed with an
+    illegal word: a corrupted mtvec would make every later trap unrecoverable."""
+    insn &= 0xFFFFFFFF
+    funct3 = (insn >> 12) & 0x7
+    src = (insn >> 15) & 0x1F
+    is_csr = (insn & 0x7F) == 0x73 and funct3 in (1, 2, 3, 5, 6, 7)
+    writes = funct3 in (1, 5) or src != 0
+    if is_csr and writes and (insn >> 20) in (0x305, 0x7C0, 0x7C1):
+        return 0x00000000
+    return insn
 
 
 def _iter_policy_instructions(result):
@@ -213,7 +232,7 @@ class IbexCpuTarget(DUTTarget):
         updates = []
         base_pc = 0x100098  # Active execution slot in test_prog.bin loop
         for idx, insn in enumerate(instructions):
-            updates.append((base_pc + (idx * 4), insn & 0xFFFFFFFF))
+            updates.append((base_pc + (idx * 4), _block_trap_vector_writes(insn)))
 
         # Always append loop-back JAL to return to base_pc after the instruction block
         loop_pc = base_pc + (len(instructions) * 4)
